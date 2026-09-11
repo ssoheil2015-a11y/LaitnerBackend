@@ -1,33 +1,45 @@
 import os
-import io
 import json
 import time
-import secrets
 import hashlib
+import secrets
 import smtplib
 from email.message import EmailMessage
 
 from flask import Flask, request, jsonify
 
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
+
+
+# =========================================================
+# Flask
+# =========================================================
+
 app = Flask(__name__)
 
 
-# =========================
-# تنظیمات
-# =========================
+# =========================================================
+# Environment Variables
+# =========================================================
 
-DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
+DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "").strip()
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get(
+    "GOOGLE_SERVICE_ACCOUNT_JSON", ""
+).strip()
+
+SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com").strip()
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_EMAIL = os.environ.get("SMTP_EMAIL", "").strip()
+SMTP_APP_PASSWORD = os.environ.get("SMTP_APP_PASSWORD", "").strip()
+
 USERS_FILE_NAME = "users.json"
 
-SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_EMAIL = os.getenv("SMTP_EMAIL")
-SMTP_APP_PASSWORD = os.getenv("SMTP_APP_PASSWORD")
 
-
-# =========================
+# =========================================================
 # Google Drive
-# =========================
+# =========================================================
 
 _drive_service = None
 
@@ -36,128 +48,133 @@ def get_drive_service():
     global _drive_service
 
     if _drive_service is None:
-        from google.oauth2.service_account import Credentials
-        from googleapiclient.discovery import build
-
-        service_account_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-
-        if not service_account_json:
-            raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is not configured")
+        if not GOOGLE_SERVICE_ACCOUNT_JSON:
+            raise RuntimeError(
+                "GOOGLE_SERVICE_ACCOUNT_JSON is not configured."
+            )
 
         if not DRIVE_FOLDER_ID:
-            raise RuntimeError("DRIVE_FOLDER_ID is not configured")
+            raise RuntimeError(
+                "DRIVE_FOLDER_ID is not configured."
+            )
 
-        credentials_info = json.loads(service_account_json)
+        try:
+            service_account_info = json.loads(
+                GOOGLE_SERVICE_ACCOUNT_JSON
+            )
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"Invalid GOOGLE_SERVICE_ACCOUNT_JSON: {e}"
+            )
 
         credentials = Credentials.from_service_account_info(
-            credentials_info,
-            scopes=["https://www.googleapis.com/auth/drive"],
+            service_account_info,
+            scopes=[
+                "https://www.googleapis.com/auth/drive"
+            ],
         )
 
         _drive_service = build(
             "drive",
             "v3",
             credentials=credentials,
+            cache_discovery=False,
         )
 
     return _drive_service
 
 
-def find_users_file_id():
+# =========================================================
+# users.json - Google Drive
+# =========================================================
+
+def find_users_file():
     service = get_drive_service()
 
     query = (
-        f"name='{USERS_FILE_NAME}' "
+        f"name = '{USERS_FILE_NAME}' "
         f"and '{DRIVE_FOLDER_ID}' in parents "
-        f"and trashed=false"
+        f"and trashed = false"
     )
 
     result = service.files().list(
         q=query,
-        fields="files(id,name)"
+        spaces="drive",
+        fields="files(id,name)",
+        pageSize=1,
     ).execute()
 
     files = result.get("files", [])
 
-    return files[0]["id"] if files else None
+    if files:
+        return files[0]["id"]
+
+    return None
 
 
 def load_users():
-    from googleapiclient.http import MediaIoBaseDownload
+    service = get_drive_service()
 
-    file_id = find_users_file_id()
+    file_id = find_users_file()
 
     if not file_id:
         return {}
 
-    service = get_drive_service()
+    content = service.files().get_media(
+        fileId=file_id
+    ).execute()
 
-    request = service.files().get_media(fileId=file_id)
-
-    buffer = io.BytesIO()
-    downloader = MediaIoBaseDownload(buffer, request)
-
-    done = False
-
-    while not done:
-        _, done = downloader.next_chunk()
-
-    buffer.seek(0)
+    if not content:
+        return {}
 
     try:
         return json.loads(
-            buffer.read().decode("utf-8")
+            content.decode("utf-8")
         )
     except Exception:
         return {}
 
 
 def save_users(users):
-    from googleapiclient.http import MediaIoBaseUpload
-
     service = get_drive_service()
 
-    content = json.dumps(
+    data = json.dumps(
         users,
         ensure_ascii=False,
-        indent=2
+        indent=2,
     ).encode("utf-8")
 
-    buffer = io.BytesIO(content)
-
     media = MediaIoBaseUpload(
-        buffer,
+        __import__("io").BytesIO(data),
         mimetype="application/json",
-        resumable=False
+        resumable=False,
     )
 
-    file_id = find_users_file_id()
+    file_id = find_users_file()
 
     if file_id:
         service.files().update(
             fileId=file_id,
-            media_body=media
+            media_body=media,
         ).execute()
-
     else:
         metadata = {
             "name": USERS_FILE_NAME,
-            "parents": [DRIVE_FOLDER_ID]
+            "parents": [DRIVE_FOLDER_ID],
         }
 
         service.files().create(
             body=metadata,
             media_body=media,
-            fields="id"
+            fields="id",
         ).execute()
 
 
-# =========================
-# رمز عبور
-# =========================
+# =========================================================
+# Password Hashing
+# =========================================================
 
 def hash_password(password, salt=None):
-
     if salt is None:
         salt = secrets.token_hex(16)
 
@@ -165,511 +182,646 @@ def hash_password(password, salt=None):
         "sha256",
         password.encode("utf-8"),
         salt.encode("utf-8"),
-        100_000
+        100_000,
     ).hex()
 
     return password_hash, salt
 
 
 def verify_password(password, salt, expected_hash):
-
     password_hash, _ = hash_password(
         password,
-        salt
+        salt,
     )
 
     return secrets.compare_digest(
         password_hash,
-        expected_hash
+        expected_hash,
     )
 
 
-# =========================
-# ایمیل
-# =========================
+# =========================================================
+# User Functions
+# =========================================================
+
+def get_user(email):
+    users = load_users()
+    return users.get(email)
+
+
+def create_user(email, password):
+    users = load_users()
+
+    password_hash, salt = hash_password(password)
+
+    code = f"{secrets.randbelow(1_000_000):06d}"
+
+    users[email] = {
+        "password_hash": password_hash,
+        "salt": salt,
+
+        "verified": False,
+
+        "verify_code": code,
+        "verify_code_expires": time.time() + 600,
+
+        "reset_code": None,
+        "reset_code_expires": None,
+    }
+
+    save_users(users)
+
+    return code
+
+
+def set_new_verify_code(email):
+    users = load_users()
+
+    if email not in users:
+        return None
+
+    code = f"{secrets.randbelow(1_000_000):06d}"
+
+    users[email]["verify_code"] = code
+    users[email]["verify_code_expires"] = time.time() + 600
+
+    save_users(users)
+
+    return code
+
+
+def mark_verified(email):
+    users = load_users()
+
+    if email not in users:
+        return False
+
+    users[email]["verified"] = True
+    users[email]["verify_code"] = None
+    users[email]["verify_code_expires"] = None
+
+    save_users(users)
+
+    return True
+
+
+def set_reset_code(email):
+    users = load_users()
+
+    if email not in users:
+        return None
+
+    code = f"{secrets.randbelow(1_000_000):06d}"
+
+    users[email]["reset_code"] = code
+    users[email]["reset_code_expires"] = time.time() + 600
+
+    save_users(users)
+
+    return code
+
+
+def reset_password(email, new_password):
+    users = load_users()
+
+    if email not in users:
+        return False
+
+    password_hash, salt = hash_password(new_password)
+
+    users[email]["password_hash"] = password_hash
+    users[email]["salt"] = salt
+
+    users[email]["reset_code"] = None
+    users[email]["reset_code_expires"] = None
+
+    save_users(users)
+
+    return True
+
+
+# =========================================================
+# Email
+# =========================================================
 
 def send_email(to_email, subject, text):
+    try:
+        if not SMTP_EMAIL:
+            return False, "SMTP_EMAIL is not configured."
 
-    if not SMTP_EMAIL or not SMTP_APP_PASSWORD:
-        raise RuntimeError("SMTP settings are not configured")
+        if not SMTP_APP_PASSWORD:
+            return False, "SMTP_APP_PASSWORD is not configured."
 
-    message = EmailMessage()
+        message = EmailMessage()
 
-    message["Subject"] = subject
-    message["From"] = SMTP_EMAIL
-    message["To"] = to_email
+        message["Subject"] = subject
+        message["From"] = SMTP_EMAIL
+        message["To"] = to_email
 
-    message.set_content(text)
+        message.set_content(text)
 
-    with smtplib.SMTP(
-        SMTP_HOST,
-        SMTP_PORT,
-        timeout=15
-    ) as server:
+        with smtplib.SMTP(
+            SMTP_HOST,
+            SMTP_PORT,
+            timeout=15,
+        ) as server:
 
-        server.starttls()
+            server.starttls()
 
-        server.login(
-            SMTP_EMAIL,
-            SMTP_APP_PASSWORD
-        )
+            server.login(
+                SMTP_EMAIL,
+                SMTP_APP_PASSWORD,
+            )
 
-        server.send_message(message)
+            server.send_message(message)
+
+        return True, None
+
+    except Exception as e:
+        return False, str(e)
 
 
-# =========================
-# بررسی ایمیل
-# =========================
-
-def valid_email(email):
-
-    return (
-        isinstance(email, str)
-        and "@" in email
-        and "." in email.split("@")[-1]
+def send_verification_email(to_email, code):
+    return send_email(
+        to_email,
+        "کد تایید ثبت‌نام - ابر نابغه",
+        f"کد تایید شما: {code}\n\nاین کد تا ۱۰ دقیقه معتبره.",
     )
 
 
-# =========================
-# صفحه اصلی
-# =========================
+def send_password_reset_email(to_email, code):
+    return send_email(
+        to_email,
+        "بازیابی رمز عبور - ابر نابغه",
+        f"کد بازیابی رمز عبور شما: {code}\n\nاین کد تا ۱۰ دقیقه معتبره.",
+    )
 
-@app.route("/")
+
+# =========================================================
+# Helpers
+# =========================================================
+
+def is_valid_email(email):
+    if not email:
+        return False
+
+    email = email.strip()
+
+    return (
+        "@" in email
+        and "." in email.split("@")[-1]
+        and " " not in email
+    )
+
+
+def get_json():
+    data = request.get_json(silent=True)
+
+    if not isinstance(data, dict):
+        return {}
+
+    return data
+
+
+# =========================================================
+# Home
+# =========================================================
+
+@app.route("/", methods=["GET"])
 def home():
-
     return "Laitner Backend is running!"
 
 
-@app.route("/health")
-def health():
+# =========================================================
+# Health
+# =========================================================
 
+@app.route("/health", methods=["GET"])
+def health():
     return jsonify({
         "status": "ok"
     })
 
 
-# =========================
-# ثبت نام
-# =========================
+# =========================================================
+# Register
+# =========================================================
 
 @app.route("/register", methods=["POST"])
 def register():
-
     try:
+        data = get_json()
 
-        data = request.get_json(silent=True) or {}
+        email = str(
+            data.get("email", "")
+        ).strip().lower()
 
-        email = data.get("email", "").strip().lower()
-        password = data.get("password", "")
+        password = str(
+            data.get("password", "")
+        )
 
-        if not valid_email(email):
-
+        if not is_valid_email(email):
             return jsonify({
                 "success": False,
-                "error": "invalid_email"
+                "error": "ایمیل معتبر نیست."
             }), 400
 
         if len(password) < 6:
-
             return jsonify({
                 "success": False,
-                "error": "password_too_short"
+                "error": "رمز عبور باید حداقل ۶ کاراکتر باشد."
             }), 400
 
-        users = load_users()
+        existing_user = get_user(email)
 
-        if email in users:
-
+        if existing_user:
             return jsonify({
                 "success": False,
-                "error": "email_already_registered"
+                "error": "این ایمیل قبلاً ثبت‌نام شده."
             }), 409
 
-        password_hash, salt = hash_password(password)
+        code = create_user(
+            email,
+            password,
+        )
 
-        code = f"{secrets.randbelow(1_000_000):06d}"
+        sent, error = send_verification_email(
+            email,
+            code,
+        )
 
-        users[email] = {
-            "password_hash": password_hash,
-            "salt": salt,
-            "verified": False,
-            "verify_code": code,
-            "verify_code_expires": time.time() + 600,
-            "reset_code": None,
-            "reset_code_expires": None
-        }
-
-        save_users(users)
-
-        try:
-
-            send_email(
-                email,
-                "کد تایید ثبت‌نام - لایتنر",
-                f"کد تایید شما: {code}\n\nاین کد تا ۱۰ دقیقه معتبر است."
-            )
-
-        except Exception as email_error:
-
-            # اگر ارسال ایمیل شکست خورد،
-            # حساب ساخته‌شده را حذف می‌کنیم.
-            users.pop(email, None)
-            save_users(users)
-
-            print("EMAIL ERROR:", email_error)
-
+        if not sent:
             return jsonify({
                 "success": False,
-                "error": "email_send_failed"
+                "error": "خطا در ارسال ایمیل تایید.",
+                "details": error,
             }), 500
 
         return jsonify({
             "success": True,
-            "message": "verification_code_sent"
-        })
-
+            "message": "ثبت‌نام انجام شد. کد تایید ارسال شد."
+        }), 201
 
     except Exception as e:
-
-        print("REGISTER ERROR:", e)
-
         return jsonify({
             "success": False,
-            "error": "server_error"
+            "error": "خطای سرور.",
+            "details": str(e),
         }), 500
 
 
-# =========================
-# تایید ایمیل
-# =========================
+# =========================================================
+# Verify Email
+# =========================================================
 
 @app.route("/verify", methods=["POST"])
 def verify():
-
     try:
+        data = get_json()
 
-        data = request.get_json(silent=True) or {}
+        email = str(
+            data.get("email", "")
+        ).strip().lower()
 
-        email = data.get("email", "").strip().lower()
-        code = str(data.get("code", "")).strip()
+        code = str(
+            data.get("code", "")
+        ).strip()
 
-        users = load_users()
-
-        user = users.get(email)
-
-        if not user:
-
+        if not email or not code:
             return jsonify({
                 "success": False,
-                "error": "user_not_found"
+                "error": "ایمیل و کد تایید الزامی هستند."
+            }), 400
+
+        user = get_user(email)
+
+        if not user:
+            return jsonify({
+                "success": False,
+                "error": "کاربر پیدا نشد."
             }), 404
 
         if user.get("verified"):
-
             return jsonify({
                 "success": True,
-                "message": "already_verified"
+                "message": "ایمیل قبلاً تایید شده."
             })
 
         if time.time() > user.get(
             "verify_code_expires",
-            0
+            0,
         ):
-
             return jsonify({
                 "success": False,
-                "error": "code_expired"
+                "error": "کد تایید منقضی شده."
             }), 400
 
         if not secrets.compare_digest(
             code,
-            str(user.get("verify_code", ""))
+            str(user.get("verify_code", "")),
         ):
-
             return jsonify({
                 "success": False,
-                "error": "wrong_code"
+                "error": "کد تایید اشتباه است."
             }), 400
 
-        user["verified"] = True
-        user["verify_code"] = None
-        user["verify_code_expires"] = None
-
-        save_users(users)
+        mark_verified(email)
 
         return jsonify({
             "success": True,
-            "message": "email_verified"
+            "message": "ایمیل با موفقیت تایید شد."
         })
 
-
     except Exception as e:
-
-        print("VERIFY ERROR:", e)
-
         return jsonify({
             "success": False,
-            "error": "server_error"
+            "error": "خطای سرور.",
+            "details": str(e),
         }), 500
 
 
-# =========================
-# ورود
-# =========================
+# =========================================================
+# Login
+# =========================================================
 
 @app.route("/login", methods=["POST"])
 def login():
-
     try:
+        data = get_json()
 
-        data = request.get_json(silent=True) or {}
+        email = str(
+            data.get("email", "")
+        ).strip().lower()
 
-        email = data.get("email", "").strip().lower()
-        password = data.get("password", "")
+        password = str(
+            data.get("password", "")
+        )
 
-        users = load_users()
+        if not email or not password:
+            return jsonify({
+                "success": False,
+                "error": "ایمیل و رمز عبور الزامی هستند."
+            }), 400
 
-        user = users.get(email)
+        user = get_user(email)
 
         if not user:
-
             return jsonify({
                 "success": False,
-                "error": "user_not_found"
-            }), 404
-
-        if not verify_password(
-            password,
-            user["salt"],
-            user["password_hash"]
-        ):
-
-            return jsonify({
-                "success": False,
-                "error": "wrong_password"
+                "error": "ایمیل یا رمز عبور اشتباه است."
             }), 401
 
         if not user.get("verified", False):
-
             return jsonify({
                 "success": False,
-                "error": "email_not_verified"
+                "error": "ایمیل شما هنوز تایید نشده."
             }), 403
+
+        valid = verify_password(
+            password,
+            user.get("salt", ""),
+            user.get("password_hash", ""),
+        )
+
+        if not valid:
+            return jsonify({
+                "success": False,
+                "error": "ایمیل یا رمز عبور اشتباه است."
+            }), 401
 
         return jsonify({
             "success": True,
-            "message": "login_success"
+            "message": "ورود موفق بود.",
+            "email": email,
         })
 
-
     except Exception as e:
-
-        print("LOGIN ERROR:", e)
-
         return jsonify({
             "success": False,
-            "error": "server_error"
+            "error": "خطای سرور.",
+            "details": str(e),
         }), 500
 
 
-# =========================
-# ارسال دوباره کد تایید
-# =========================
+# =========================================================
+# Resend Verification
+# =========================================================
 
 @app.route("/resend-verification", methods=["POST"])
 def resend_verification():
-
     try:
+        data = get_json()
 
-        data = request.get_json(silent=True) or {}
+        email = str(
+            data.get("email", "")
+        ).strip().lower()
 
-        email = data.get("email", "").strip().lower()
-
-        users = load_users()
-
-        user = users.get(email)
-
-        if not user:
-
+        if not email:
             return jsonify({
                 "success": False,
-                "error": "user_not_found"
+                "error": "ایمیل الزامی است."
+            }), 400
+
+        user = get_user(email)
+
+        if not user:
+            return jsonify({
+                "success": False,
+                "error": "کاربر پیدا نشد."
             }), 404
 
         if user.get("verified"):
-
             return jsonify({
                 "success": False,
-                "error": "already_verified"
+                "error": "این ایمیل قبلاً تایید شده."
             }), 400
 
-        code = f"{secrets.randbelow(1_000_000):06d}"
+        code = set_new_verify_code(email)
 
-        user["verify_code"] = code
-        user["verify_code_expires"] = time.time() + 600
+        if not code:
+            return jsonify({
+                "success": False,
+                "error": "ساخت کد جدید ناموفق بود."
+            }), 500
 
-        save_users(users)
-
-        send_email(
+        sent, error = send_verification_email(
             email,
-            "کد تایید جدید - لایتنر",
-            f"کد تایید جدید شما: {code}\n\nاین کد تا ۱۰ دقیقه معتبر است."
+            code,
         )
 
+        if not sent:
+            return jsonify({
+                "success": False,
+                "error": "خطا در ارسال ایمیل.",
+                "details": error,
+            }), 500
+
         return jsonify({
-            "success": True
+            "success": True,
+            "message": "کد جدید ارسال شد."
         })
 
-
     except Exception as e:
-
-        print("RESEND ERROR:", e)
-
         return jsonify({
             "success": False,
-            "error": "server_error"
+            "error": "خطای سرور.",
+            "details": str(e),
         }), 500
 
 
-# =========================
-# درخواست بازیابی رمز
-# =========================
+# =========================================================
+# Forgot Password
+# =========================================================
 
 @app.route("/forgot-password", methods=["POST"])
 def forgot_password():
-
     try:
+        data = get_json()
 
-        data = request.get_json(silent=True) or {}
+        email = str(
+            data.get("email", "")
+        ).strip().lower()
 
-        email = data.get("email", "").strip().lower()
-
-        users = load_users()
-
-        user = users.get(email)
-
-        if not user:
-
+        if not email:
             return jsonify({
                 "success": False,
-                "error": "user_not_found"
+                "error": "ایمیل الزامی است."
+            }), 400
+
+        user = get_user(email)
+
+        if not user:
+            return jsonify({
+                "success": False,
+                "error": "کاربری با این ایمیل پیدا نشد."
             }), 404
 
-        code = f"{secrets.randbelow(1_000_000):06d}"
+        code = set_reset_code(email)
 
-        user["reset_code"] = code
-        user["reset_code_expires"] = time.time() + 600
+        if not code:
+            return jsonify({
+                "success": False,
+                "error": "ساخت کد بازیابی ناموفق بود."
+            }), 500
 
-        save_users(users)
-
-        send_email(
+        sent, error = send_password_reset_email(
             email,
-            "بازیابی رمز عبور - لایتنر",
-            f"کد بازیابی رمز عبور شما: {code}\n\nاین کد تا ۱۰ دقیقه معتبر است."
+            code,
         )
 
+        if not sent:
+            return jsonify({
+                "success": False,
+                "error": "خطا در ارسال ایمیل بازیابی.",
+                "details": error,
+            }), 500
+
         return jsonify({
-            "success": True
+            "success": True,
+            "message": "کد بازیابی ارسال شد."
         })
 
-
     except Exception as e:
-
-        print("FORGOT PASSWORD ERROR:", e)
-
         return jsonify({
             "success": False,
-            "error": "server_error"
+            "error": "خطای سرور.",
+            "details": str(e),
         }), 500
 
 
-# =========================
-# تغییر رمز با کد بازیابی
-# =========================
+# =========================================================
+# Reset Password
+# =========================================================
 
 @app.route("/reset-password", methods=["POST"])
-def reset_password():
-
+def reset_password_route():
     try:
+        data = get_json()
 
-        data = request.get_json(silent=True) or {}
+        email = str(
+            data.get("email", "")
+        ).strip().lower()
 
-        email = data.get("email", "").strip().lower()
-        code = str(data.get("code", "")).strip()
-        new_password = data.get("new_password", "")
+        code = str(
+            data.get("code", "")
+        ).strip()
 
-        if len(new_password) < 6:
+        new_password = str(
+            data.get("new_password", "")
+        )
 
+        if not email or not code or not new_password:
             return jsonify({
                 "success": False,
-                "error": "password_too_short"
+                "error": "ایمیل، کد و رمز جدید الزامی هستند."
             }), 400
 
-        users = load_users()
-
-        user = users.get(email)
-
-        if not user:
-
+        if len(new_password) < 6:
             return jsonify({
                 "success": False,
-                "error": "user_not_found"
+                "error": "رمز عبور باید حداقل ۶ کاراکتر باشد."
+            }), 400
+
+        user = get_user(email)
+
+        if not user:
+            return jsonify({
+                "success": False,
+                "error": "کاربر پیدا نشد."
             }), 404
 
         if time.time() > user.get(
             "reset_code_expires",
-            0
+            0,
         ):
-
             return jsonify({
                 "success": False,
-                "error": "code_expired"
+                "error": "کد بازیابی منقضی شده."
             }), 400
 
         if not secrets.compare_digest(
             code,
-            str(user.get("reset_code", ""))
+            str(user.get("reset_code", "")),
         ):
-
             return jsonify({
                 "success": False,
-                "error": "wrong_code"
+                "error": "کد بازیابی اشتباه است."
             }), 400
 
-        password_hash, salt = hash_password(
-            new_password
+        success = reset_password(
+            email,
+            new_password,
         )
 
-        user["password_hash"] = password_hash
-        user["salt"] = salt
-        user["reset_code"] = None
-        user["reset_code_expires"] = None
-
-        save_users(users)
+        if not success:
+            return jsonify({
+                "success": False,
+                "error": "تغییر رمز عبور ناموفق بود."
+            }), 500
 
         return jsonify({
             "success": True,
-            "message": "password_reset_success"
+            "message": "رمز عبور با موفقیت تغییر کرد."
         })
 
-
     except Exception as e:
-
-        print("RESET PASSWORD ERROR:", e)
-
         return jsonify({
             "success": False,
-            "error": "server_error"
+            "error": "خطای سرور.",
+            "details": str(e),
         }), 500
 
 
-# =========================
-# اجرای سرور
-# =========================
+# =========================================================
+# Run
+# =========================================================
 
 if __name__ == "__main__":
+    port = int(
+        os.environ.get("PORT", 5000)
+    )
 
     app.run(
         host="0.0.0.0",
-        port=int(os.getenv("PORT", 5000))
+        port=port,
     )
